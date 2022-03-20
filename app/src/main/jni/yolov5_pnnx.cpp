@@ -40,6 +40,8 @@ static ncnn::Net yolov5;
 static ncnn::UnlockedPoolAllocator g_blob_pool_allocator;
 static ncnn::PoolAllocator g_workspace_pool_allocator;
 
+static int modelType;
+
 struct Object
 {
     cv::Rect_<float> rect;
@@ -144,8 +146,14 @@ static void generate_proposals(const ncnn::Mat& anchors, int stride, const ncnn:
 
     const int num_anchors = anchors.w / 2;
 
-    const int num_class = 7;
-
+    //是异常检测模型
+    int num_class = 7;
+    int no = 12;
+    if (modelType == 1) {
+        //是手部、口部检测模型
+        num_class = 2;
+        no = 7;
+    }
 
     for (int q = 0; q < num_anchors; q++)
     {
@@ -161,7 +169,7 @@ static void generate_proposals(const ncnn::Mat& anchors, int stride, const ncnn:
                 float class_score = -FLT_MAX;
                 for (int k = 0; k < num_class; k++)
                 {
-                    float score = feat_blob.channel(q * 12 + 5 + k).row(i)[j];
+                    float score = feat_blob.channel(q * no + 5 + k).row(i)[j];
                     if (score > class_score)
                     {
                         class_index = k;
@@ -169,7 +177,7 @@ static void generate_proposals(const ncnn::Mat& anchors, int stride, const ncnn:
                     }
                 }
 
-                float box_score = feat_blob.channel(q * 12 + 4).row(i)[j];
+                float box_score = feat_blob.channel(q * no + 4).row(i)[j];
 
                 float confidence = sigmoid(box_score) * sigmoid(class_score);
 
@@ -180,10 +188,10 @@ static void generate_proposals(const ncnn::Mat& anchors, int stride, const ncnn:
                     // y[..., 0:2] = (y[..., 0:2] * 2. - 0.5 + self.grid[i].to(x[i].device)) * self.stride[i]  # xy
                     // y[..., 2:4] = (y[..., 2:4] * 2) ** 2 * self.anchor_grid[i]  # wh
 
-                    float dx = sigmoid(feat_blob.channel(q * 12 + 0).row(i)[j]);
-                    float dy = sigmoid(feat_blob.channel(q * 12 + 1).row(i)[j]);
-                    float dw = sigmoid(feat_blob.channel(q * 12 + 2).row(i)[j]);
-                    float dh = sigmoid(feat_blob.channel(q * 12 + 3).row(i)[j]);
+                    float dx = sigmoid(feat_blob.channel(q * no + 0).row(i)[j]);
+                    float dy = sigmoid(feat_blob.channel(q * no + 1).row(i)[j]);
+                    float dw = sigmoid(feat_blob.channel(q * no + 2).row(i)[j]);
+                    float dh = sigmoid(feat_blob.channel(q * no + 3).row(i)[j]);
 
                     float pb_cx = (dx * 2.f - 0.5f + j) * stride;
                     float pb_cy = (dy * 2.f - 0.5f + i) * stride;
@@ -424,6 +432,34 @@ static jfieldID hId;
 static jfieldID labelId;
 static jfieldID probId;
 
+char* Jstring2CStr(JNIEnv* env, jstring jstr) {
+    char* rtn = NULL;
+    jclass clsstring = env ->FindClass("java/lang/String");
+    jstring strencode = env->NewStringUTF("GB2312");
+    jmethodID mid = env->GetMethodID(clsstring, "getBytes", "(Ljava/lang/String;)[B");
+    jbyteArray barr = (jbyteArray)env->CallObjectMethod(jstr, mid, strencode);
+    jsize alen = env->GetArrayLength(barr);
+    jbyte *ba = env->GetByteArrayElements(barr, JNI_FALSE);
+    if (alen > 0) {
+        rtn = (char*) malloc(alen+1);
+        memcpy(rtn, ba, alen);
+        rtn[alen] = 0;
+    }
+    env->ReleaseByteArrayElements(barr, ba, 0);
+    return rtn;
+}
+
+char** stringArr2CharArr(JNIEnv* env, jobjectArray strArray) {
+    jstring jstr;
+    jsize len = env->GetArrayLength(strArray);
+    char **pstr = (char **) malloc(len*sizeof(char *));
+    for (int i = 0; i < len; i++) {
+        jstr = (jstring) env->GetObjectArrayElement(strArray, i);
+        pstr[i] = (char *)(*env).GetStringUTFChars(jstr, 0);
+    }
+    return pstr;
+}
+
 JNIEXPORT jint JNI_OnLoad(JavaVM* vm, void* reserved)
 {
     __android_log_print(ANDROID_LOG_DEBUG, "YoloV5Ncnn", "JNI_OnLoad");
@@ -444,6 +480,8 @@ JNIEXPORT void JNI_OnUnload(JavaVM* vm, void* reserved)
 JNIEXPORT jboolean JNICALL Java_com_tencent_yolov5ncnn_YoloV5Ncnn_Init(JNIEnv* env, jobject thiz, jobject assetManager)
 {
 
+    modelType = 0;
+
     ncnn::Option opt;
     opt.lightmode = true;
     opt.num_threads = 4;
@@ -458,6 +496,8 @@ JNIEXPORT jboolean JNICALL Java_com_tencent_yolov5ncnn_YoloV5Ncnn_Init(JNIEnv* e
     yolov5.opt = opt;
 
     AAssetManager* mgr = AAssetManager_fromJava(env, assetManager);
+
+    double start_time = ncnn::get_current_time();
 
     // init param
     {
@@ -479,6 +519,9 @@ JNIEXPORT jboolean JNICALL Java_com_tencent_yolov5ncnn_YoloV5Ncnn_Init(JNIEnv* e
         }
     }
 
+    double elasped = ncnn::get_current_time() - start_time;
+    __android_log_print(ANDROID_LOG_DEBUG, "YoloV5Ncnn", "%.2fms   load_model", elasped);
+
     // init jni glue
     jclass localObjCls = env->FindClass("com/tencent/yolov5ncnn/YoloV5Ncnn$Obj");
     objCls = reinterpret_cast<jclass>(env->NewGlobalRef(localObjCls));
@@ -491,6 +534,74 @@ JNIEXPORT jboolean JNICALL Java_com_tencent_yolov5ncnn_YoloV5Ncnn_Init(JNIEnv* e
     hId = env->GetFieldID(objCls, "h", "F");
     labelId = env->GetFieldID(objCls, "label", "Ljava/lang/String;");
     probId = env->GetFieldID(objCls, "prob", "F");
+
+    return JNI_TRUE;
+}
+
+JNIEXPORT jboolean JNICALL Java_com_tencent_yolov5ncnn_YoloV5Ncnn_loadHandModel(JNIEnv* env, jobject thiz, jobject assetManager)
+{
+
+    modelType = 1;
+
+    AAssetManager* mgr = AAssetManager_fromJava(env, assetManager);
+
+    double start_time = ncnn::get_current_time();
+
+    // init param
+    {
+        int ret = yolov5.load_param(mgr, "hands_best.ncnn.param");
+        if (ret != 0)
+        {
+            __android_log_print(ANDROID_LOG_DEBUG, "YoloV5Ncnn", "load_param failed");
+            return JNI_FALSE;
+        }
+    }
+
+    // init bin
+    {
+        int ret = yolov5.load_model(mgr, "hands_best.ncnn.bin");
+        if (ret != 0)
+        {
+            __android_log_print(ANDROID_LOG_DEBUG, "YoloV5Ncnn", "load_model failed");
+            return JNI_FALSE;
+        }
+    }
+
+    double elasped = ncnn::get_current_time() - start_time;
+    __android_log_print(ANDROID_LOG_DEBUG, "YoloV5Ncnn", "%.2fms   load_model", elasped);
+
+    return JNI_TRUE;
+}
+
+JNIEXPORT jboolean JNICALL Java_com_tencent_yolov5ncnn_YoloV5Ncnn_loadMouthModel(JNIEnv* env, jobject thiz, jobject assetManager)
+{
+
+    AAssetManager* mgr = AAssetManager_fromJava(env, assetManager);
+
+    double start_time = ncnn::get_current_time();
+
+    // init param
+    {
+        int ret = yolov5.load_param(mgr, "mouth_best.ncnn.param");
+        if (ret != 0)
+        {
+            __android_log_print(ANDROID_LOG_DEBUG, "YoloV5Ncnn", "load_param failed");
+            return JNI_FALSE;
+        }
+    }
+
+    // init bin
+    {
+        int ret = yolov5.load_model(mgr, "mouth_best.ncnn.bin");
+        if (ret != 0)
+        {
+            __android_log_print(ANDROID_LOG_DEBUG, "YoloV5Ncnn", "load_model failed");
+            return JNI_FALSE;
+        }
+    }
+
+    double elasped = ncnn::get_current_time() - start_time;
+    __android_log_print(ANDROID_LOG_DEBUG, "YoloV5Ncnn", "%.2fms   load_model", elasped);
 
     return JNI_TRUE;
 }
@@ -696,24 +807,44 @@ JNIEXPORT jobjectArray JNICALL Java_com_tencent_yolov5ncnn_YoloV5Ncnn_Detect(JNI
 //        "microwave", "oven", "toaster", "sink", "refrigerator", "book", "clock", "vase", "scissors", "teddy bear",
 //        "hair drier", "toothbrush"
 //    };
-    static const char* class_names[] = {
-        "abnormal oral", "oral herpes", "hand scars", "hand rash", "facial scars", "red eye", "tooth decay"
-    };
+
 
     jobjectArray jObjArray = env->NewObjectArray(objects.size(), objCls, NULL);
 
-    for (size_t i=0; i<objects.size(); i++)
-    {
-        jobject jObj = env->NewObject(objCls, constructortorId, thiz);
+    if (modelType == 1) {
+        static const char* class_names[] = {
+            "open mouth", "push hands"
+        };
+        for (size_t i=0; i<objects.size(); i++)
+        {
+            jobject jObj = env->NewObject(objCls, constructortorId, thiz);
 
-        env->SetFloatField(jObj, xId, objects[i].rect.x);
-        env->SetFloatField(jObj, yId, objects[i].rect.y);
-        env->SetFloatField(jObj, wId, objects[i].rect.width);
-        env->SetFloatField(jObj, hId, objects[i].rect.height);
-        env->SetObjectField(jObj, labelId, env->NewStringUTF(class_names[objects[i].label]));
-        env->SetFloatField(jObj, probId, objects[i].prob);
+            env->SetFloatField(jObj, xId, objects[i].rect.x);
+            env->SetFloatField(jObj, yId, objects[i].rect.y);
+            env->SetFloatField(jObj, wId, objects[i].rect.width);
+            env->SetFloatField(jObj, hId, objects[i].rect.height);
+            env->SetObjectField(jObj, labelId, env->NewStringUTF(class_names[objects[i].label]));
+            env->SetFloatField(jObj, probId, objects[i].prob);
 
-        env->SetObjectArrayElement(jObjArray, i, jObj);
+            env->SetObjectArrayElement(jObjArray, i, jObj);
+        }
+    } else {
+        static const char* class_names[] = {
+            "abnormal oral", "oral herpes", "hand scars", "hand rash", "facial scars", "red eye", "tooth decay"
+        };
+        for (size_t i=0; i<objects.size(); i++)
+        {
+            jobject jObj = env->NewObject(objCls, constructortorId, thiz);
+
+            env->SetFloatField(jObj, xId, objects[i].rect.x);
+            env->SetFloatField(jObj, yId, objects[i].rect.y);
+            env->SetFloatField(jObj, wId, objects[i].rect.width);
+            env->SetFloatField(jObj, hId, objects[i].rect.height);
+            env->SetObjectField(jObj, labelId, env->NewStringUTF(class_names[objects[i].label]));
+            env->SetFloatField(jObj, probId, objects[i].prob);
+
+            env->SetObjectArrayElement(jObjArray, i, jObj);
+        }
     }
 
 
